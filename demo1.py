@@ -1,4 +1,3 @@
-
 import sys
 import json
 import os
@@ -10,33 +9,74 @@ from datetime import datetime
 from contextlib import ExitStack
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QCoreApplication
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QTextEdit,
-                               QPushButton, QComboBox, QLabel, QFileDialog,
-                               QStatusBar, QVBoxLayout, QHBoxLayout, QMessageBox,
-                               QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
-                               QFontComboBox, QLineEdit, QCheckBox, QColorDialog,
-                               QListWidget, QListWidgetItem)
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QTextEdit,
+    QPushButton,
+    QComboBox,
+    QLabel,
+    QFileDialog,
+    QStatusBar,
+    QVBoxLayout,
+    QHBoxLayout,
+    QMessageBox,
+    QDialog,
+    QFormLayout,
+    QSpinBox,
+    QDialogButtonBox,
+    QFontComboBox,
+    QLineEdit,
+    QCheckBox,
+    QColorDialog,
+    QListWidget,
+    QListWidgetItem
+)
 from PySide6.QtGui import QTextCursor, QIcon, QColor, QFont
 
 # Use the external pyqtdarktheme package.
 import qdarktheme
 
+# Import resampling tool from SciPy.
+from scipy.signal import resample
+
 MODEL_DIR = "models"
 CAPTURE_DIR = "captures"
 
+###############################################################################
+# Helper function to determine device type based on its name.
+###############################################################################
+def get_device_type(device_name):
+    name = device_name.lower()
+    if "built-in" in name or "internal" in name:
+        return "Internal"
+    elif ("headphone" in name or "headset" in name or "usb" in name or "earphone" in name):  # <-- Added 'earphone' here
+        return "External"
+    else:
+        return "Unknown"
 
 ###############################################################################
-# SpeechThread for single device (modified to support device selection)
+# SpeechThread for a single device (supports optional loopback)
 ###############################################################################
 class SpeechThread(QThread):
     update_text = Signal(str, bool)  # text, is_partial
     language_detected = Signal(str)
 
-    def __init__(self, model_path, sample_rate=16000, block_size=8000, device=None):
+    def __init__(self, model_path, sample_rate=16000, block_size=8000, device=None, loopback=False):
         super().__init__()
-        self.sample_rate = sample_rate
+        # If a device is specified, query the appropriate info.
+        if device is not None:
+            try:
+                info = sd.query_devices(device, 'input' if not loopback else 'output')
+                self.sample_rate = info.get("default_samplerate", sample_rate)
+            except Exception:
+                self.sample_rate = sample_rate
+        else:
+            self.sample_rate = sample_rate
         self.block_size = block_size
-        self.device = device  # Pass device to RawInputStream
+        self.device = device
+        self.loopback = loopback
         self.model = vosk.Model(model_path)
         self.recognizer = vosk.KaldiRecognizer(self.model, self.sample_rate)
         self.running = False
@@ -44,7 +84,6 @@ class SpeechThread(QThread):
         self.current_language = self.detect_language(model_path)
 
     def detect_language(self, model_path):
-        # Extract language code from model folder name if possible.
         dir_name = os.path.basename(model_path)
         parts = dir_name.split("-")
         if len(parts) >= 3:
@@ -56,12 +95,18 @@ class SpeechThread(QThread):
     def run(self):
         self.running = True
         try:
-            with sd.RawInputStream(samplerate=self.sample_rate,
-                                   blocksize=self.block_size,
-                                   dtype='int16',
-                                   channels=1,
-                                   device=self.device,
-                                   callback=self.audio_callback):
+            kwargs = {
+                "samplerate": self.sample_rate,
+                "blocksize": self.block_size,
+                "dtype": 'int16',
+                "channels": 1,
+                "device": self.device,
+                "callback": self.audio_callback
+            }
+            # Only add loopback if requested and not on Linux.
+            if self.loopback and not sys.platform.startswith('linux'):
+                kwargs["loopback"] = True
+            with sd.RawInputStream(**kwargs):
                 self.language_detected.emit(self.current_language)
                 while self.running:
                     data = self.q.get()
@@ -80,59 +125,91 @@ class SpeechThread(QThread):
     def stop(self):
         self.running = False
 
-
 ###############################################################################
-# MultiSpeechThread for multiple devices (mixing inputs)
+# MultiSpeechThread for multiple devices (each with its own config)
+# device_configs is a list of tuples: (device_index, loopback_flag)
 ###############################################################################
 class MultiSpeechThread(QThread):
     update_text = Signal(str, bool)
     language_detected = Signal(str)
 
-    def __init__(self, model_path, device_indices, sample_rate=16000, block_size=8000):
+    def __init__(self, model_path, device_configs, target_sample_rate=16000, block_size=8000):
         super().__init__()
-        self.device_indices = device_indices  # list of device IDs (ints)
-        self.sample_rate = sample_rate
-        self.block_size = block_size
+        self.device_configs = device_configs  # e.g. [(3, False), (5, True)]
+        self.target_sample_rate = target_sample_rate
+        self.block_size = block_size  # target block size (in samples at target rate)
         self.model = vosk.Model(model_path)
-        self.recognizer = vosk.KaldiRecognizer(self.model, self.sample_rate)
+        self.recognizer = vosk.KaldiRecognizer(self.model, self.target_sample_rate)
         self.running = False
-        # Create a queue for each device.
-        self.queues = {dev: queue.Queue() for dev in self.device_indices}
-        self.current_language = "UNKNOWN"  # Could be refined if needed.
+        self.queues = {}
+        self.device_rates = {}
+        for (dev, loopback) in self.device_configs:
+            self.queues[(dev, loopback)] = queue.Queue()
+            try:
+                info = sd.query_devices(dev, 'input' if not loopback else 'output')
+                self.device_rates[(dev, loopback)] = info.get("default_samplerate", self.target_sample_rate)
+            except Exception:
+                self.device_rates[(dev, loopback)] = self.target_sample_rate
+        self.current_language = "UNKNOWN"
 
-    def make_callback(self, dev):
+    def make_callback(self, dev, loopback):
         def callback(indata, frames, time, status):
-            self.queues[dev].put(bytes(indata))
+            self.queues[(dev, loopback)].put(bytes(indata))
         return callback
 
     def run(self):
         self.running = True
         with ExitStack() as stack:
             streams = []
-            for dev in self.device_indices:
-                cb = self.make_callback(dev)
-                stream = stack.enter_context(
-                    sd.RawInputStream(samplerate=self.sample_rate,
-                                      blocksize=self.block_size,
-                                      dtype='int16',
-                                      channels=1,
-                                      device=dev,
-                                      callback=cb))
+            for (dev, loopback) in self.device_configs:
+                device_rate = self.device_rates[(dev, loopback)]
+                # Adjust block size so that capture duration remains consistent.
+                device_block_size = int(self.block_size * device_rate / self.target_sample_rate)
+                cb = self.make_callback(dev, loopback)
+
+                if loopback and not sys.platform.startswith('linux'):
+                    stream = stack.enter_context(
+                        sd.RawInputStream(
+                            samplerate=device_rate,
+                            blocksize=device_block_size,
+                            dtype='int16',
+                            channels=1,
+                            device=dev,
+                            callback=cb,
+                            loopback=True
+                        )
+                    )
+                else:
+                    stream = stack.enter_context(
+                        sd.RawInputStream(
+                            samplerate=device_rate,
+                            blocksize=device_block_size,
+                            dtype='int16',
+                            channels=1,
+                            device=dev,
+                            callback=cb
+                        )
+                    )
                 streams.append(stream)
+
             self.language_detected.emit(self.current_language)
             while self.running:
                 data_list = []
-                for dev in self.device_indices:
+                for (dev, loopback) in self.device_configs:
                     try:
-                        data = self.queues[dev].get(timeout=1.0)
+                        data = self.queues[(dev, loopback)].get(timeout=1.0)
                         arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                        device_rate = self.device_rates[(dev, loopback)]
+                        if device_rate != self.target_sample_rate:
+                            arr = resample(arr, self.block_size)
                         data_list.append(arr)
                     except queue.Empty:
                         data_list.append(np.zeros(self.block_size, dtype=np.float32))
-                # Combine by averaging the arrays.
+
                 combined = np.mean(data_list, axis=0)
                 combined_int16 = np.clip(combined, -32768, 32767).astype(np.int16)
                 combined_bytes = combined_int16.tobytes()
+
                 if self.recognizer.AcceptWaveform(combined_bytes):
                     result = json.loads(self.recognizer.Result())
                     self.update_text.emit(result.get('text', ''), False)
@@ -143,33 +220,32 @@ class MultiSpeechThread(QThread):
     def stop(self):
         self.running = False
 
-
 ###############################################################################
-# Settings Dialog (Expanded with Audio Devices selection)
+# Settings Dialog with separate Input and Output device selection,
+# Always on Top and Auto Switch options.
 ###############################################################################
 class SettingsDialog(QDialog):
     def __init__(self, current_settings, default_settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(400, 450)
+        self.resize(500, 600)
         self.default_settings = default_settings.copy()
         self.current_settings = current_settings.copy()
-        # Store current font color.
         self.font_color = self.current_settings.get("font_color", "#dcdcdc")
 
         layout = QFormLayout(self)
 
-        # Sample Rate
+        # Target Sample Rate
         self.sample_rate_spin = QSpinBox()
         self.sample_rate_spin.setRange(8000, 48000)
         self.sample_rate_spin.setValue(self.current_settings.get("sample_rate", 16000))
-        layout.addRow("Sample Rate:", self.sample_rate_spin)
+        layout.addRow("Target Sample Rate (Hz):", self.sample_rate_spin)
 
         # Block Size
         self.block_size_spin = QSpinBox()
         self.block_size_spin.setRange(1000, 16000)
         self.block_size_spin.setValue(self.current_settings.get("block_size", 8000))
-        layout.addRow("Block Size:", self.block_size_spin)
+        layout.addRow("Block Size (samples):", self.block_size_spin)
 
         # Theme selection (Dark or Light)
         self.theme_combo = QComboBox()
@@ -188,51 +264,67 @@ class SettingsDialog(QDialog):
         self.font_size_spin.setValue(self.current_settings.get("font_size", 15))
         layout.addRow("Font Size:", self.font_size_spin)
 
-        # Font Color via Color Picker button.
+        # Font Color
         self.font_color_button = QPushButton("Select Font Color")
         self.font_color_button.setStyleSheet(f"background-color: {self.font_color};")
         self.font_color_button.clicked.connect(self.choose_font_color)
         layout.addRow("Font Color:", self.font_color_button)
 
-        # Window Transparency (0-100%)
+        # Window Transparency
         self.transparency_spin = QSpinBox()
         self.transparency_spin.setRange(0, 100)
         self.transparency_spin.setValue(self.current_settings.get("transparency", 100))
         layout.addRow("Window Transparency (%):", self.transparency_spin)
 
-        # Allow text transparency checkbox.
+        # Text Transparency Checkbox
         self.text_transparency_checkbox = QCheckBox("Allow text transparency")
         self.text_transparency_checkbox.setChecked(self.current_settings.get("text_transparency", False))
         layout.addRow("Text Transparency:", self.text_transparency_checkbox)
 
-        # Audio Devices selection (multi-selection list).
-        self.device_list_widget = QListWidget()
-        self.device_list_widget.setSelectionMode(QListWidget.MultiSelection)
-        # Populate with available input devices.
-        devices = []
-        for i, d in enumerate(sd.query_devices()):
-            if d["max_input_channels"] > 0:
-                item_text = f"{d['name']} (ID: {i})"
+        # Always on Top Checkbox
+        self.always_on_top_checkbox = QCheckBox("Always on Top")
+        self.always_on_top_checkbox.setChecked(self.current_settings.get("always_on_top", False))
+        layout.addRow("Always on Top:", self.always_on_top_checkbox)
+
+        # Auto Switch Headphone Checkbox
+        self.auto_switch_checkbox = QCheckBox("Auto Switch to Headphone")
+        self.auto_switch_checkbox.setChecked(self.current_settings.get("auto_switch_headphone", False))
+        layout.addRow("Auto Switch Headphone:", self.auto_switch_checkbox)
+
+        # Separate lists for Input and Output audio devices.
+        self.input_list_widget = QListWidget()
+        self.input_list_widget.setSelectionMode(QListWidget.MultiSelection)
+        self.output_list_widget = QListWidget()
+        self.output_list_widget.setSelectionMode(QListWidget.MultiSelection)
+        all_devices = sd.query_devices()
+        for i, d in enumerate(all_devices):
+            # For input devices.
+            if d.get("max_input_channels", 0) > 0:
+                host_api_info = sd.query_hostapis(d["hostapi"])
+                host_api_name = host_api_info.get("name", "Unknown API")
+                default_sr = d.get("default_samplerate", "unknown")
+                item_text = f"{d['name']} - {host_api_name}, {default_sr} Hz (ID: {i}) [Input]"
                 item = QListWidgetItem(item_text)
                 item.setData(Qt.UserRole, i)
-                self.device_list_widget.addItem(item)
-                devices.append(i)
-        # Pre-select devices saved in current_settings.
-        saved_devices_str = self.current_settings.get("audio_devices", "")
-        if saved_devices_str:
-            saved_ids = [int(x.strip()) for x in saved_devices_str.split(",") if x.strip()]
-            for index in range(self.device_list_widget.count()):
-                item = self.device_list_widget.item(index)
-                if item.data(Qt.UserRole) in saved_ids:
-                    item.setSelected(True)
-        layout.addRow("Audio Devices:", self.device_list_widget)
+                self.input_list_widget.addItem(item)
+            # For output devices.
+            if d.get("max_output_channels", 0) > 0:
+                host_api_info = sd.query_hostapis(d["hostapi"])
+                host_api_name = host_api_info.get("name", "Unknown API")
+                default_sr = d.get("default_samplerate", "unknown")
+                item_text = f"{d['name']} - {host_api_name}, {default_sr} Hz (ID: {i}) [Output]"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, i)
+                self.output_list_widget.addItem(item)
+
+        layout.addRow("Input Audio Devices:", self.input_list_widget)
+        layout.addRow("Output Audio Devices:", self.output_list_widget)
 
         # Buttons: OK, Cancel, Restore Defaults.
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.restore_button = QPushButton("Restore Defaults")
         layout.addRow(self.restore_button)
         layout.addWidget(self.buttons)
-
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         self.restore_button.clicked.connect(self.restore_defaults)
@@ -253,15 +345,20 @@ class SettingsDialog(QDialog):
         self.font_color_button.setStyleSheet(f"background-color: {self.font_color};")
         self.transparency_spin.setValue(self.default_settings.get("transparency", 100))
         self.text_transparency_checkbox.setChecked(self.default_settings.get("text_transparency", False))
-        # Clear selection in audio devices.
-        self.device_list_widget.clearSelection()
+        self.always_on_top_checkbox.setChecked(self.default_settings.get("always_on_top", False))
+        self.auto_switch_checkbox.setChecked(self.default_settings.get("auto_switch_headphone", False))
+        self.input_list_widget.clearSelection()
+        self.output_list_widget.clearSelection()
 
     def get_settings(self):
-        # Get selected audio device IDs.
-        selected = []
-        for item in self.device_list_widget.selectedItems():
-            selected.append(str(item.data(Qt.UserRole)))
-        audio_devices = ",".join(selected)
+        input_selected = []
+        for item in self.input_list_widget.selectedItems():
+            input_selected.append(str(item.data(Qt.UserRole)))
+
+        output_selected = []
+        for item in self.output_list_widget.selectedItems():
+            output_selected.append(str(item.data(Qt.UserRole)))
+
         return {
             "sample_rate": self.sample_rate_spin.value(),
             "block_size": self.block_size_spin.value(),
@@ -271,9 +368,11 @@ class SettingsDialog(QDialog):
             "font_color": self.font_color,
             "transparency": self.transparency_spin.value(),
             "text_transparency": self.text_transparency_checkbox.isChecked(),
-            "audio_devices": audio_devices
+            "always_on_top": self.always_on_top_checkbox.isChecked(),
+            "auto_switch_headphone": self.auto_switch_checkbox.isChecked(),
+            "audio_input_devices": ",".join(input_selected),
+            "audio_output_devices": ",".join(output_selected)
         }
-
 
 ###############################################################################
 # Main Application with Persistent Settings and Multi-Device Support
@@ -286,6 +385,7 @@ class LiveCaptionApp(QMainWindow):
         self.current_save_filename = None
         self.saved_lines = set()
 
+        # Extend default settings with new keys.
         self.default_settings = {
             "sample_rate": 16000,
             "block_size": 8000,
@@ -295,11 +395,13 @@ class LiveCaptionApp(QMainWindow):
             "font_color": "#dcdcdc",
             "transparency": 100,
             "text_transparency": False,
-            "audio_devices": ""
+            "always_on_top": False,
+            "auto_switch_headphone": False,
+            "audio_input_devices": "",
+            "audio_output_devices": ""
         }
         self.settings = self.load_settings()
 
-        # Apply initial theme via pyqtdarktheme.
         try:
             qdarktheme.setup_theme(self.settings["theme"].lower())
         except AttributeError:
@@ -325,7 +427,10 @@ class LiveCaptionApp(QMainWindow):
         loaded["font_color"] = s.value("font_color", self.default_settings["font_color"])
         loaded["transparency"] = int(s.value("transparency", self.default_settings["transparency"]))
         loaded["text_transparency"] = s.value("text_transparency", "false").lower() == "true"
-        loaded["audio_devices"] = s.value("audio_devices", self.default_settings["audio_devices"])
+        loaded["always_on_top"] = s.value("always_on_top", str(self.default_settings["always_on_top"])).lower() == "true"
+        loaded["auto_switch_headphone"] = s.value("auto_switch_headphone", str(self.default_settings["auto_switch_headphone"])).lower() == "true"
+        loaded["audio_input_devices"] = s.value("audio_input_devices", self.default_settings["audio_input_devices"])
+        loaded["audio_output_devices"] = s.value("audio_output_devices", self.default_settings["audio_output_devices"])
         return loaded
 
     def save_settings(self):
@@ -338,7 +443,10 @@ class LiveCaptionApp(QMainWindow):
         s.setValue("font_color", self.settings["font_color"])
         s.setValue("transparency", self.settings["transparency"])
         s.setValue("text_transparency", self.settings["text_transparency"])
-        s.setValue("audio_devices", self.settings["audio_devices"])
+        s.setValue("always_on_top", self.settings["always_on_top"])
+        s.setValue("auto_switch_headphone", self.settings["auto_switch_headphone"])
+        s.setValue("audio_input_devices", self.settings["audio_input_devices"])
+        s.setValue("audio_output_devices", self.settings["audio_output_devices"])
 
     def init_ui(self):
         self.setWindowTitle("Live Caption Pro")
@@ -402,17 +510,28 @@ class LiveCaptionApp(QMainWindow):
             app = QApplication.instance()
             if app:
                 app.setStyleSheet(qdarktheme.load_stylesheet(theme_choice))
+
         font = QFont(self.settings.get("font_family", "Segoe UI"), self.settings.get("font_size", 15))
         self.text_display.setFont(font)
+
         if self.settings.get("text_transparency", False):
             color = self.hex_to_rgba(self.settings.get("font_color", "#dcdcdc"), self.settings.get("transparency", 100))
         else:
             color = self.settings.get("font_color", "#dcdcdc")
+
         self.text_display.setStyleSheet(f"color: {color};")
         self.btn_start.setStyleSheet(f"color: {color};")
         self.btn_stop.setStyleSheet(f"color: {color};")
         self.btn_save.setStyleSheet(f"color: {color};")
+
         self.setWindowOpacity(self.settings.get("transparency", 100) / 100.0)
+
+        # Apply "Always on Top" setting.
+        if self.settings.get("always_on_top", False):
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        else:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+        self.show()  # Refresh window flags
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self.settings, self.default_settings, parent=self)
@@ -425,8 +544,10 @@ class LiveCaptionApp(QMainWindow):
 
     def load_models(self):
         if os.path.exists(MODEL_DIR):
-            self.available_models = [d for d in os.listdir(MODEL_DIR)
-                                     if os.path.isdir(os.path.join(MODEL_DIR, d))]
+            self.available_models = [
+                d for d in os.listdir(MODEL_DIR)
+                if os.path.isdir(os.path.join(MODEL_DIR, d))
+            ]
         else:
             self.available_models = []
         if not self.available_models:
@@ -437,46 +558,103 @@ class LiveCaptionApp(QMainWindow):
     def start_recording(self):
         if not self.available_models:
             return
+
         if self.current_save_filename is None:
             if not os.path.exists(CAPTURE_DIR):
                 os.makedirs(CAPTURE_DIR)
-            lang_code = (self.lbl_language.text().split()[-1].lower()
-                         if self.lbl_language.text() else "unknown")
+            lang_code = (
+                self.lbl_language.text().split()[-1].lower()
+                if self.lbl_language.text() else "unknown"
+            )
             self.current_save_filename = os.path.join(
                 CAPTURE_DIR, f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{lang_code}.txt"
             )
+
         model_name = self.model_selector.currentText()
         model_path = os.path.join(MODEL_DIR, model_name)
-        # Determine selected audio devices.
-        audio_devices_str = self.settings.get("audio_devices", "")
-        if audio_devices_str:
-            device_list = [int(x.strip()) for x in audio_devices_str.split(",") if x.strip()]
+
+        # Build device configurations from manually selected input and output devices.
+        device_configs = []
+        # If Auto Switch Headphone is enabled, override manual selection.
+        if self.settings.get("auto_switch_headphone", False):
+            all_devices = sd.query_devices()
+            for i, d in enumerate(all_devices):
+                name_lower = d["name"].lower()
+                if "headphone" in name_lower or "headset" in name_lower or "earphone" in name_lower:  # <-- Added 'earphone' here
+                    # Always add microphone input if available.
+                    if d.get("max_input_channels", 0) > 0:
+                        device_configs.append((i, False))
+                    # For capturing output: on non-Linux, force loopback if the device's host API is WASAPI
+                    # or if it reports any output channels.
+                    if not sys.platform.startswith('linux'):
+                        host_api = sd.query_hostapis(d["hostapi"])
+                        if host_api.get("name", "").lower() == "wasapi" or d.get("max_output_channels", 0) > 0:
+                            device_configs.append((i, True))
+                    else:
+                        # On Linux, you may need to manually select a monitor device.
+                        if "monitor" in name_lower:
+                            device_configs.append((i, False))
+            # Fallback if none found.
+            if not device_configs:
+                self.status_bar.showMessage("Auto-switch enabled but no headphone/earphone devices found.")
         else:
-            device_list = []
-        try:
-            if len(device_list) > 1:
-                self.speech_thread = MultiSpeechThread(model_path, device_list,
-                                                       sample_rate=self.settings["sample_rate"],
-                                                       block_size=self.settings["block_size"])
-            else:
-                device = device_list[0] if device_list else None
-                self.speech_thread = SpeechThread(model_path,
-                                                  sample_rate=self.settings["sample_rate"],
-                                                  block_size=self.settings["block_size"],
-                                                  device=device)
-            self.speech_thread.update_text.connect(self.update_caption)
-            self.speech_thread.language_detected.connect(self.update_language)
-            self.speech_thread.start()
-            self.start_time = datetime.now()
-            self.btn_start.setEnabled(False)
-            self.btn_stop.setEnabled(True)
-            self.model_selector.setEnabled(False)
-            self.status_bar.showMessage("Recording...")
-            self.auto_save_timer = QTimer()
-            self.auto_save_timer.timeout.connect(self.auto_save)
-            self.auto_save_timer.start(30000)
-        except Exception as e:
-            self.status_bar.showMessage(f"Error: {str(e)}")
+            input_str = self.settings.get("audio_input_devices", "")
+            output_str = self.settings.get("audio_output_devices", "")
+            if input_str:
+                for id_str in input_str.split(","):
+                    try:
+                        dev_id = int(id_str.strip())
+                        device_configs.append((dev_id, False))
+                    except ValueError:
+                        pass
+            if output_str:
+                for id_str in output_str.split(","):
+                    try:
+                        dev_id = int(id_str.strip())
+                        # For output devices, use loopback if supported.
+                        if not sys.platform.startswith('linux'):
+                            device_configs.append((dev_id, True))
+                        else:
+                            device_configs.append((dev_id, False))
+                    except ValueError:
+                        pass
+
+        if device_configs:
+            try:
+                # If more than one device configuration is selected, use the multi-device thread.
+                if len(device_configs) > 1:
+                    self.speech_thread = MultiSpeechThread(
+                        model_path,
+                        device_configs,
+                        target_sample_rate=self.settings["sample_rate"],
+                        block_size=self.settings["block_size"]
+                    )
+                else:
+                    # Single device: use SpeechThread.
+                    dev, loopback = device_configs[0]
+                    self.speech_thread = SpeechThread(
+                        model_path,
+                        sample_rate=self.settings["sample_rate"],
+                        block_size=self.settings["block_size"],
+                        device=dev,
+                        loopback=loopback
+                    )
+
+                self.speech_thread.update_text.connect(self.update_caption)
+                self.speech_thread.language_detected.connect(self.update_language)
+                self.speech_thread.start()
+                self.start_time = datetime.now()
+                self.btn_start.setEnabled(False)
+                self.btn_stop.setEnabled(True)
+                self.model_selector.setEnabled(False)
+                self.status_bar.showMessage("Recording...")
+                self.auto_save_timer = QTimer()
+                self.auto_save_timer.timeout.connect(self.auto_save)
+                self.auto_save_timer.start(30000)
+            except Exception as e:
+                self.status_bar.showMessage(f"Error: {str(e)}")
+        else:
+            self.status_bar.showMessage("No valid audio devices selected.")
 
     def stop_recording(self):
         if self.speech_thread:
@@ -493,6 +671,7 @@ class LiveCaptionApp(QMainWindow):
     def update_caption(self, text, is_partial):
         cursor = self.text_display.textCursor()
         cursor.movePosition(QTextCursor.End)
+
         if is_partial:
             if hasattr(self, 'partial_start'):
                 cursor.setPosition(self.partial_start)
@@ -510,7 +689,7 @@ class LiveCaptionApp(QMainWindow):
                 del self.partial_start
             text = text.strip()
             if text and not text.endswith(('.', '!', '?')):
-                text += "  ."
+                text += ". "
             self.text_display.setTextColor(QColor('#dcdcdc'))
             cursor.insertText("\n" + text)
             self.full_text.append(text)
@@ -540,7 +719,8 @@ class LiveCaptionApp(QMainWindow):
         options = QFileDialog.Options()
         default_name = self.current_save_filename if self.current_save_filename else "captions.txt"
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Save Captions", default_name, "Text Files (*.txt)", options=options)
+            self, "Save Captions", default_name, "Text Files (*.txt)", options=options
+        )
         if filename:
             new_lines = []
             for line in self.full_text:
@@ -554,68 +734,6 @@ class LiveCaptionApp(QMainWindow):
                 self.full_text = []
             except Exception as e:
                 self.status_bar.showMessage(f"Save error: {str(e)}", 5000)
-
-
-###############################################################################
-# MultiSpeechThread for multiple audio devices
-###############################################################################
-class MultiSpeechThread(QThread):
-    update_text = Signal(str, bool)
-    language_detected = Signal(str)
-
-    def __init__(self, model_path, device_indices, sample_rate=16000, block_size=8000):
-        super().__init__()
-        self.device_indices = device_indices
-        self.sample_rate = sample_rate
-        self.block_size = block_size
-        self.model = vosk.Model(model_path)
-        self.recognizer = vosk.KaldiRecognizer(self.model, self.sample_rate)
-        self.running = False
-        self.queues = {dev: queue.Queue() for dev in self.device_indices}
-        self.current_language = "UNKNOWN"
-
-    def make_callback(self, dev):
-        def callback(indata, frames, time, status):
-            self.queues[dev].put(bytes(indata))
-        return callback
-
-    def run(self):
-        self.running = True
-        with ExitStack() as stack:
-            streams = []
-            for dev in self.device_indices:
-                cb = self.make_callback(dev)
-                stream = stack.enter_context(
-                    sd.RawInputStream(samplerate=self.sample_rate,
-                                      blocksize=self.block_size,
-                                      dtype='int16',
-                                      channels=1,
-                                      device=dev,
-                                      callback=cb))
-                streams.append(stream)
-            self.language_detected.emit(self.current_language)
-            while self.running:
-                data_list = []
-                for dev in self.device_indices:
-                    try:
-                        data = self.queues[dev].get(timeout=1.0)
-                        arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                        data_list.append(arr)
-                    except queue.Empty:
-                        data_list.append(np.zeros(self.block_size, dtype=np.float32))
-                combined = np.mean(data_list, axis=0)
-                combined_int16 = np.clip(combined, -32768, 32767).astype(np.int16)
-                combined_bytes = combined_int16.tobytes()
-                if self.recognizer.AcceptWaveform(combined_bytes):
-                    result = json.loads(self.recognizer.Result())
-                    self.update_text.emit(result.get('text', ''), False)
-                else:
-                    partial = json.loads(self.recognizer.PartialResult())
-                    self.update_text.emit(partial.get('partial', ''), True)
-
-    def stop(self):
-        self.running = False
-
 
 ###############################################################################
 # Main Entry Point
