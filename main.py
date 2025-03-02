@@ -103,9 +103,7 @@ class SpeechThread(QThread):
                 "device": self.device,
                 "callback": self.audio_callback
             }
-            # Only add loopback if requested and not on Linux.
-            if self.loopback and not sys.platform.startswith('linux'):
-                kwargs["loopback"] = True
+
             with sd.RawInputStream(**kwargs):
                 self.language_detected.emit(self.current_language)
                 while self.running:
@@ -167,29 +165,17 @@ class MultiSpeechThread(QThread):
                 device_block_size = int(self.block_size * device_rate / self.target_sample_rate)
                 cb = self.make_callback(dev, loopback)
 
-                if loopback and not sys.platform.startswith('linux'):
-                    stream = stack.enter_context(
-                        sd.RawInputStream(
-                            samplerate=device_rate,
-                            blocksize=device_block_size,
-                            dtype='int16',
-                            channels=1,
-                            device=dev,
-                            callback=cb,
-                            loopback=True
-                        )
-                    )
-                else:
-                    stream = stack.enter_context(
-                        sd.RawInputStream(
+
+                stream = stack.enter_context(
+                    sd.RawInputStream(
                             samplerate=device_rate,
                             blocksize=device_block_size,
                             dtype='int16',
                             channels=1,
                             device=dev,
                             callback=cb
-                        )
                     )
+                )
                 streams.append(stream)
 
             self.language_detected.emit(self.current_language)
@@ -584,22 +570,10 @@ class LiveCaptionApp(QMainWindow):
                     # Always add microphone input if available.
                     if d.get("max_input_channels", 0) > 0:
                         device_configs.append((i, False))
-                    # For capturing output: on non-Linux, force loopback if the device's host API is WASAPI
-                    # or if it reports any output channels.
-                    if not sys.platform.startswith('linux'):
-                        host_api = sd.query_hostapis(d["hostapi"])
-                        if host_api.get("name", "").lower() == "wasapi" or d.get("max_output_channels", 0) > 0:
-                            device_configs.append((i, True))
-                    else:
-                        # On Linux, you may need to manually select a monitor device.
-                        if "monitor" in name_lower:
-                            device_configs.append((i, False))
-            # Fallback if none found.
-            if not device_configs:
-                self.status_bar.showMessage("Auto-switch enabled but no headphone/earphone devices found.")
+         
         else:
             input_str = self.settings.get("audio_input_devices", "")
-            output_str = self.settings.get("audio_output_devices", "")
+
             if input_str:
                 for id_str in input_str.split(","):
                     try:
@@ -607,17 +581,7 @@ class LiveCaptionApp(QMainWindow):
                         device_configs.append((dev_id, False))
                     except ValueError:
                         pass
-            if output_str:
-                for id_str in output_str.split(","):
-                    try:
-                        dev_id = int(id_str.strip())
-                        # For output devices, use loopback if supported.
-                        if not sys.platform.startswith('linux'):
-                            device_configs.append((dev_id, True))
-                        else:
-                            device_configs.append((dev_id, False))
-                    except ValueError:
-                        pass
+     
 
         if device_configs:
             try:
