@@ -572,7 +572,7 @@ class LiveCaptionApp(QMainWindow):
 
         model_name = self.model_selector.currentText()
         model_path = os.path.join(MODEL_DIR, model_name)
-
+#设置
         # Build device configurations from manually selected input and output devices.
         device_configs = []
         # If Auto Switch Headphone is enabled, override manual selection.
